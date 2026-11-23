@@ -6,13 +6,13 @@ from datetime import datetime
 import discord
 from discord import app_commands
 from discord.ext import commands
-import aiosqlite
+import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "levels.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # レベルアップ通知を送る専用チャンネルのID（0 = 無効、発言チャンネルに送る）
 LEVELUP_CHANNEL_ID = int(os.getenv("LEVELUP_CHANNEL_ID", "0"))
@@ -20,20 +20,18 @@ LEVELUP_CHANNEL_ID = int(os.getenv("LEVELUP_CHANNEL_ID", "0"))
 # XP 設定
 XP_PER_MESSAGE_MIN = 15
 XP_PER_MESSAGE_MAX = 25
-XP_PER_THREAD = 50       # スレッド作成
-XP_PER_REACTION = 3      # リアクションを付けた側に付与
-XP_COOLDOWN_SECONDS = 60  # メッセージXPのクールダウン（秒）
+XP_PER_THREAD = 50
+XP_PER_REACTION = 3
+XP_COOLDOWN_SECONDS = 60
 
 
 # ---- レベル計算 ----
 
 def xp_for_next_level(level: int) -> int:
-    """レベル level → level+1 に必要な XP"""
     return 5 * (level ** 2) + 50 * level + 100
 
 
 def total_xp_for_level(level: int) -> int:
-    """レベル 0 からレベル level に到達するまでの累計 XP"""
     return sum(xp_for_next_level(i) for i in range(level))
 
 
@@ -54,25 +52,30 @@ class LevelBot(commands.Bot):
         intents.guilds = True
         intents.members = True
         super().__init__(command_prefix="!", intents=intents)
-        # クールダウン管理: {(guild_id, user_id): datetime}
         self.xp_cooldowns: dict[tuple[int, int], datetime] = {}
+        self.db_pool: asyncpg.Pool | None = None
 
     async def setup_hook(self):
+        self.db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         await self._init_db()
         await self.tree.sync()
         print("スラッシュコマンドを同期しました")
 
     async def _init_db(self):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
+        async with self.db_pool.acquire() as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_xp (
-                    guild_id INTEGER NOT NULL,
-                    user_id  INTEGER NOT NULL,
-                    xp       INTEGER DEFAULT 0,
+                    guild_id BIGINT NOT NULL,
+                    user_id  BIGINT NOT NULL,
+                    xp       BIGINT DEFAULT 0,
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
-            await db.commit()
+
+    async def close(self):
+        if self.db_pool:
+            await self.db_pool.close()
+        await super().close()
 
 
 bot = LevelBot()
@@ -81,35 +84,31 @@ bot = LevelBot()
 # ---- DB ヘルパー ----
 
 async def get_xp(guild_id: int, user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT xp FROM user_xp WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        ) as cur:
-            row = await cur.fetchone()
-    return row[0] if row else 0
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT xp FROM user_xp WHERE guild_id=$1 AND user_id=$2",
+            guild_id, user_id,
+        )
+    return row["xp"] if row else 0
 
 
 async def add_xp(guild_id: int, user_id: int, amount: int) -> tuple[int, int, int]:
-    """XP を追加して (旧レベル, 新レベル, 新合計XP) を返す"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT xp FROM user_xp WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        ) as cur:
-            row = await cur.fetchone()
-        old_xp = row[0] if row else 0
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT xp FROM user_xp WHERE guild_id=$1 AND user_id=$2",
+            guild_id, user_id,
+        )
+        old_xp = row["xp"] if row else 0
         new_xp = old_xp + amount
         old_level = get_level(old_xp)
         new_level = get_level(new_xp)
-        await db.execute(
+        await conn.execute(
             """
-            INSERT INTO user_xp (guild_id, user_id, xp) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET xp=excluded.xp
+            INSERT INTO user_xp (guild_id, user_id, xp) VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET xp = EXCLUDED.xp
             """,
-            (guild_id, user_id, new_xp),
+            guild_id, user_id, new_xp,
         )
-        await db.commit()
     return old_level, new_level, new_xp
 
 
@@ -122,7 +121,6 @@ async def send_levelup(
     total_xp: int,
     fallback: discord.abc.Messageable | None = None,
 ):
-    # 専用チャンネルが設定されていればそちらに送る
     channel: discord.abc.Messageable | None = None
     if LEVELUP_CHANNEL_ID and guild:
         channel = guild.get_channel(LEVELUP_CHANNEL_ID)
@@ -139,11 +137,7 @@ async def send_levelup(
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="合計 XP", value=f"{total_xp:,} XP", inline=True)
-    embed.add_field(
-        name="次のレベルまで",
-        value=f"{next_total - total_xp:,} XP",
-        inline=True,
-    )
+    embed.add_field(name="次のレベルまで", value=f"{next_total - total_xp:,} XP", inline=True)
     try:
         await channel.send(embed=embed)
     except discord.Forbidden:
@@ -166,7 +160,6 @@ async def on_message(message: discord.Message):
     key = (message.guild.id, message.author.id)
     now = datetime.utcnow()
 
-    # クールダウンチェック
     last = bot.xp_cooldowns.get(key)
     if last and (now - last).total_seconds() < XP_COOLDOWN_SECONDS:
         await bot.process_commands(message)
@@ -250,17 +243,15 @@ async def cmd_leaderboard(interaction: discord.Interaction, page: int = 1):
     per_page = 10
     offset = (page - 1) * per_page
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, xp FROM user_xp WHERE guild_id=? ORDER BY xp DESC LIMIT ? OFFSET ?",
-            (interaction.guild_id, per_page, offset),
-        ) as cur:
-            rows = await cur.fetchall()
-        async with db.execute(
-            "SELECT COUNT(*) FROM user_xp WHERE guild_id=?",
-            (interaction.guild_id,),
-        ) as cur:
-            (total,) = await cur.fetchone()
+    async with bot.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, xp FROM user_xp WHERE guild_id=$1 ORDER BY xp DESC LIMIT $2 OFFSET $3",
+            interaction.guild_id, per_page, offset,
+        )
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_xp WHERE guild_id=$1",
+            interaction.guild_id,
+        )
 
     if not rows:
         await interaction.response.send_message("まだランキングデータがありません。", ephemeral=True)
@@ -269,13 +260,13 @@ async def cmd_leaderboard(interaction: discord.Interaction, page: int = 1):
     medals = ["🥇", "🥈", "🥉"]
     total_pages = max(1, math.ceil(total / per_page))
     lines = []
-    for i, (uid, xp) in enumerate(rows):
+    for i, row in enumerate(rows):
         rank = offset + i + 1
         medal = medals[rank - 1] if rank <= 3 else f"`{rank}.`"
-        lv = get_level(xp)
-        member = interaction.guild.get_member(uid)
-        name = member.display_name if member else f"<@{uid}>"
-        lines.append(f"{medal} {name} — Lv.**{lv}** ({xp:,} XP)")
+        lv = get_level(row["xp"])
+        member = interaction.guild.get_member(row["user_id"])
+        name = member.display_name if member else f"<@{row['user_id']}>"
+        lines.append(f"{medal} {name} — Lv.**{lv}** ({row['xp']:,} XP)")
 
     embed = discord.Embed(
         title="🏆 XP ランキング",
@@ -292,13 +283,12 @@ async def cmd_rank(interaction: discord.Interaction):
     gid = interaction.guild_id
     xp = await get_xp(gid, uid)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM user_xp WHERE guild_id=? AND xp > ?",
-            (gid, xp),
-        ) as cur:
-            (rank,) = await cur.fetchone()
-    rank += 1  # 自分より多い人数 + 1
+    async with bot.db_pool.acquire() as conn:
+        rank = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_xp WHERE guild_id=$1 AND xp > $2",
+            gid, xp,
+        )
+    rank += 1
 
     lv = get_level(xp)
     embed = discord.Embed(
@@ -314,6 +304,8 @@ async def cmd_rank(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     if not TOKEN:
-        print("エラー: DISCORD_TOKEN が設定されていません。.env ファイルを確認してください。")
+        print("エラー: DISCORD_TOKEN が設定されていません。")
+    elif not DATABASE_URL:
+        print("エラー: DATABASE_URL が設定されていません。")
     else:
         bot.run(TOKEN)
