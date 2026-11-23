@@ -127,11 +127,13 @@ async def send_levelup(
         if channel is None:
             try:
                 channel = await guild.fetch_channel(LEVELUP_CHANNEL_ID)
-            except (discord.NotFound, discord.Forbidden):
+            except (discord.NotFound, discord.Forbidden) as e:
+                print(f"[WARN] LEVELUP_CHANNEL_ID={LEVELUP_CHANNEL_ID} 取得失敗: {e}")
                 channel = None
     if channel is None:
         channel = fallback
     if channel is None:
+        print(f"[WARN] send_levelup: 送信先チャンネルが見つかりません (user={user.id} level={level})")
         return
 
     next_total = total_xp_for_level(level + 1)
@@ -145,8 +147,14 @@ async def send_levelup(
     embed.add_field(name="次のレベルまで", value=f"{next_total - total_xp:,} XP", inline=True)
     try:
         await channel.send(embed=embed)
+        print(f"[INFO] レベルアップ通知送信: {user} → Lv{level} (ch={getattr(channel, 'id', '?')})")
     except discord.Forbidden:
-        pass
+        print(f"[WARN] チャンネル {getattr(channel, 'id', '?')} への送信権限なし、フォールバックへ切り替え")
+        if fallback is not None and fallback is not channel:
+            try:
+                await fallback.send(embed=embed)
+            except discord.Forbidden:
+                print(f"[WARN] フォールバックチャンネルへの送信も失敗")
 
 
 # ---- イベントハンドラ ----
