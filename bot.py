@@ -220,6 +220,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.Member | dis
 @bot.tree.command(name="level", description="自分または指定ユーザーのレベルを確認")
 @app_commands.describe(user="確認したいユーザー（省略すると自分）")
 async def cmd_level(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer()
     target = user or interaction.user
     xp = await get_xp(interaction.guild_id, target.id)
     lv = get_level(xp)
@@ -247,12 +248,13 @@ async def cmd_level(interaction: discord.Interaction, user: discord.Member = Non
         inline=False,
     )
     embed.add_field(name="次のレベルまで", value=f"{next_total - xp:,} XP", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="サーバーの XP ランキングを表示")
 @app_commands.describe(page="ページ番号（デフォルト: 1）")
 async def cmd_leaderboard(interaction: discord.Interaction, page: int = 1):
+    await interaction.response.defer()
     per_page = 10
     offset = (page - 1) * per_page
 
@@ -267,7 +269,7 @@ async def cmd_leaderboard(interaction: discord.Interaction, page: int = 1):
         )
 
     if not rows:
-        await interaction.response.send_message("まだランキングデータがありません。", ephemeral=True)
+        await interaction.followup.send("まだランキングデータがありません。", ephemeral=True)
         return
 
     medals = ["🥇", "🥈", "🥉"]
@@ -287,11 +289,12 @@ async def cmd_leaderboard(interaction: discord.Interaction, page: int = 1):
         color=discord.Color.gold(),
     )
     embed.set_footer(text=f"ページ {page} / {total_pages}")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="rank", description="サーバー内での自分の順位を確認")
 async def cmd_rank(interaction: discord.Interaction):
+    await interaction.response.defer()
     uid = interaction.user.id
     gid = interaction.guild_id
     xp = await get_xp(gid, uid)
@@ -312,7 +315,7 @@ async def cmd_rank(interaction: discord.Interaction):
     embed.add_field(name="順位", value=f"**{rank} 位**", inline=True)
     embed.add_field(name="レベル", value=f"**{lv}**", inline=True)
     embed.add_field(name="XP", value=f"{xp:,}", inline=True)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 if __name__ == "__main__":
