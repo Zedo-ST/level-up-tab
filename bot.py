@@ -124,6 +124,11 @@ async def send_levelup(
     channel: discord.abc.Messageable | None = None
     if LEVELUP_CHANNEL_ID and guild:
         channel = guild.get_channel(LEVELUP_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(LEVELUP_CHANNEL_ID)
+            except (discord.NotFound, discord.Forbidden):
+                channel = None
     if channel is None:
         channel = fallback
     if channel is None:
